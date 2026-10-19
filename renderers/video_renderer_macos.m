@@ -2439,6 +2439,7 @@ void video_renderer_stop(void) {
     g_decode_errors = 0;
     g_source_frame_interval = 0.0;
     g_prev_decode_time = 0;
+    g_last_frame_time = 0; // wave1r10 N2: per-session reset — no cross-session stall misattribution
     g_fps_frame_count = 0;
     g_fps_last_time = 0;
     g_fps_decode_count = 0;
@@ -2506,12 +2507,12 @@ void video_renderer_pause(void) {
     // Client-side stream suspension (mirroring 0x56/0x5e "stream stopping",
     // e.g. the sender's screen locking): wall-clock stamped so a stalled
     // decode window can be attributed later.
-    log_msg(LOGGER_INFO, "Video stream paused by client (t=%.3f)", wall_time_seconds());
+    log_msg(LOGGER_INFO, "Video stream paused (t=%.3f)", wall_time_seconds());
     set_video_paused(true, false);
 }
 
 void video_renderer_resume(void) {
-    log_msg(LOGGER_INFO, "Video stream resumed by client (t=%.3f)", wall_time_seconds());
+    log_msg(LOGGER_INFO, "Video stream resumed (t=%.3f)", wall_time_seconds());
     set_video_paused(false, false);
 }
 
