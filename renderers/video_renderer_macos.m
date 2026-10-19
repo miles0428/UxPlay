@@ -79,7 +79,6 @@ static bool g_always_on_top = false;
 static char *g_server_name = NULL;
 typedef enum {
     WINDOW_TITLE_MODE_NONE = 0,
-    WINDOW_TITLE_MODE_READY,
     WINDOW_TITLE_MODE_STREAMING,
     WINDOW_TITLE_MODE_CUSTOM
 } window_title_mode_t;
@@ -97,10 +96,6 @@ static bool g_cover_art_texture_rebuild_pending = false;
 static char *g_track_title = NULL;
 static char *g_track_artist = NULL;
 static char *g_track_album = NULL;
-
-// Idle screen texture
-static id<MTLTexture> g_idle_texture = NULL;
-static bool g_idle_texture_created = false;
 
 // Display window and layer
 static NSWindow *g_window = NULL;
@@ -132,7 +127,7 @@ static uint64_t g_frames_rendered = 0;
 static uint64_t g_decode_errors = 0;
 static uint64_t g_last_stats_time = 0;
 static uint64_t g_last_frame_time = 0;  // mach_absolute_time of last decoded frame
-static const double FRAME_STALL_TIMEOUT = 30.0;  // seconds before showing idle screen
+static const double FRAME_STALL_TIMEOUT = 30.0;  // seconds without a decoded frame before the diagnostic decode-gap log
 static dispatch_source_t g_stall_timer = NULL;
 static uint64_t g_last_stall_log_time = 0;  // throttle stall log messages
 
@@ -161,6 +156,35 @@ static void decompress_callback(void *decompressionOutputRefCon,
                                 CVImageBufferRef imageBuffer,
                                 CMTime presentationTimeStamp,
                                 CMTime presentationDuration);
+
+// Dock presence is window-driven: the helper bundle's Info.plist starts the
+// process as a UIElement (no Dock item while idle), window creation promotes
+// the app to Regular (see create_window_on_main_thread), and the window
+// teardown paths withdraw it again — but only once no window is left, so a
+// session hand-over (stop -> next session) never flickers through the wrong
+// state. Main thread only (AppKit state).
+static void withdraw_dock_presence_if_windowless(void) {
+    if (g_window != NULL) {
+        return;
+    }
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+}
+
+// Wall-clock seconds since the epoch. The NATIVE log lines otherwise carry no
+// timestamps; the decode-gap / pause / resume diagnostics below need a wall
+// clock so a later analysis can line them up with the system log and tell a
+// sender-side pause (0x56/0x5e, client sleeping) apart from receiver-side
+// throttling.
+static double wall_time_seconds(void) {
+    return [[NSDate date] timeIntervalSince1970];
+}
+
+// App Nap opt-out for the life of a session window: while this token is held
+// the process is protected from timer/socket throttling even when it is in
+// the background (runningboardd showed the App Nap account flipping during
+// streaming while it was unprotected). Started in create_window_on_main_thread,
+// ended in destroy_window.
+static id<NSObject> g_activity_token = nil;
 
 #pragma mark - Logging
 
@@ -495,8 +519,6 @@ static void toggle_fullscreen(void) {
 
     dispatch_async(dispatch_get_main_queue(), ^{
         cancel_manual_rotation_animation_on_main_thread();
-        g_idle_texture_created = false;
-        g_idle_texture = nil;
         if (g_fullscreen) {
             // Exit fullscreen
             [g_window setStyleMask:NSWindowStyleMaskTitled |
@@ -677,6 +699,11 @@ static void toggle_fullscreen(void) {
 
         NSModalResponse response = [alert runModal];
         if (response == NSAlertFirstButtonReturn) {
+            // The window closes now (the app quits right below): withdraw the
+            // Dock presence with it, synchronously. The SIGTERM shutdown tears
+            // the window down asynchronously (cleanup() -> destroy_window on
+            // the main queue) and may reach exit(0) before that block runs.
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
             kill(getpid(), SIGTERM);
             return YES;
         }
@@ -684,6 +711,7 @@ static void toggle_fullscreen(void) {
     }
 
     // Single display - quit immediately
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     kill(getpid(), SIGTERM);
     return YES;
 }
@@ -706,9 +734,6 @@ static void apply_window_title_on_main_thread(void) {
     NSString *status = nil;
 
     switch (g_window_title_mode) {
-        case WINDOW_TITLE_MODE_READY:
-            status = @"Ready";
-            break;
         case WINDOW_TITLE_MODE_STREAMING:
             {
                 const char *state = g_paused ? "Paused" : "Streaming";
@@ -763,9 +788,6 @@ static void refresh_window_title(void) {
 static void update_window_title(const char *status) {
     if (!status || status[0] == '\0') {
         g_window_title_mode = WINDOW_TITLE_MODE_NONE;
-        set_owned_string(&g_window_title_custom_status, NULL);
-    } else if (strcmp(status, "Ready") == 0) {
-        g_window_title_mode = WINDOW_TITLE_MODE_READY;
         set_owned_string(&g_window_title_custom_status, NULL);
     } else if (strcmp(status, "Streaming") == 0) {
         g_window_title_mode = WINDOW_TITLE_MODE_STREAMING;
@@ -870,336 +892,6 @@ static void create_menu_bar(void) {
     [menuBar addItem:debugMenuItem];
 
     [NSApp setMainMenu:menuBar];
-}
-
-#pragma mark - Idle Screen
-
-static void create_idle_texture(size_t width, size_t height) {
-    if (!g_metal_device) return;
-
-    @autoreleasepool {
-        // Create bitmap context directly with BGRA format for Metal
-        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-        size_t bytesPerRow = width * 4;
-        uint8_t *pixelData = (uint8_t *)calloc(height * bytesPerRow, 1);
-
-        CGContextRef cgContext = CGBitmapContextCreate(pixelData,
-                                                       width, height,
-                                                       8, bytesPerRow,
-                                                       colorSpace,
-                                                       kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-        CGColorSpaceRelease(colorSpace);
-
-        if (!cgContext) {
-            free(pixelData);
-            return;
-        }
-
-        // Flip coordinate system so Y=0 is at top (matching Metal's coordinate system)
-        CGContextTranslateCTM(cgContext, 0, height);
-        CGContextScaleCTM(cgContext, 1.0, -1.0);
-
-        // Create NSGraphicsContext from CGContext for drawing with AppKit
-        NSGraphicsContext *nsContext = [NSGraphicsContext graphicsContextWithCGContext:cgContext flipped:YES];
-        [NSGraphicsContext saveGraphicsState];
-        [NSGraphicsContext setCurrentContext:nsContext];
-
-        CGFloat canvasWidth = (CGFloat)width;
-        CGFloat canvasHeight = (CGFloat)height;
-        CGFloat minDimension = MIN(canvasWidth, canvasHeight);
-        CGFloat uiScale = fmin(1.55, fmax(1.0, fmin(canvasWidth / 1680.0, canvasHeight / 1050.0)));
-
-        // Background wash with a soft blue focus so the screen feels alive without looking busy.
-        NSGradient *backgroundGradient = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithRed:0.13 green:0.14 blue:0.17 alpha:1.0]
-                                                                       endingColor:[NSColor colorWithRed:0.05 green:0.06 blue:0.08 alpha:1.0]];
-        [backgroundGradient drawInRect:NSMakeRect(0, 0, canvasWidth, canvasHeight) angle:90];
-
-        NSGradient *ambientGlow = [[NSGradient alloc] initWithColorsAndLocations:
-                                   [NSColor colorWithRed:0.34 green:0.45 blue:0.68 alpha:0.22], 0.0,
-                                   [NSColor colorWithRed:0.18 green:0.23 blue:0.33 alpha:0.10], 0.35,
-                                   [NSColor colorWithWhite:0.0 alpha:0.0], 1.0,
-                                   nil];
-        NSPoint glowCenter = NSMakePoint(canvasWidth * 0.5, canvasHeight * 0.36);
-        [ambientGlow drawFromCenter:glowCenter
-                             radius:0.0
-                           toCenter:glowCenter
-                             radius:minDimension * 0.78
-                            options:0];
-
-        NSBezierPath *topVeil = [NSBezierPath bezierPathWithRect:NSMakeRect(0, 0, canvasWidth, canvasHeight * 0.42)];
-        [[NSColor colorWithWhite:1.0 alpha:0.025] setFill];
-        [topVeil fill];
-
-        NSMutableParagraphStyle *centerStyle = [[NSMutableParagraphStyle alloc] init];
-        centerStyle.alignment = NSTextAlignmentCenter;
-
-        CGFloat badgeFontSize = fmax(13.0 * uiScale, fmin(minDimension * 0.020, 18.0 * uiScale));
-        NSDictionary *badgeAttrs = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:badgeFontSize weight:NSFontWeightSemibold],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.78],
-            NSParagraphStyleAttributeName: centerStyle
-        };
-        NSString *badgeText = @"AIRPLAY RECEIVER";
-        NSSize badgeSize = [badgeText sizeWithAttributes:badgeAttrs];
-        NSRect badgeRect = NSMakeRect((canvasWidth - (badgeSize.width + 32.0 * uiScale)) / 2.0,
-                                      canvasHeight * 0.15,
-                                      badgeSize.width + 32.0 * uiScale,
-                                      badgeSize.height + 12.0 * uiScale);
-        NSBezierPath *badgePath = [NSBezierPath bezierPathWithRoundedRect:badgeRect
-                                                                  xRadius:badgeRect.size.height / 2.0
-                                                                  yRadius:badgeRect.size.height / 2.0];
-        [[NSColor colorWithWhite:1.0 alpha:0.08] setFill];
-        [badgePath fill];
-        [[NSColor colorWithWhite:1.0 alpha:0.10] setStroke];
-        [badgePath setLineWidth:1.0];
-        [badgePath stroke];
-        [badgeText drawInRect:NSInsetRect(badgeRect, 0.0, 6.0 * uiScale) withAttributes:badgeAttrs];
-
-        CGFloat plateSize = fmax(176.0 * uiScale, fmin(minDimension * 0.32, 280.0 * uiScale));
-        NSRect plateRect = NSMakeRect((canvasWidth - plateSize) / 2.0,
-                                      CGRectGetMaxY(badgeRect) + minDimension * 0.035,
-                                      plateSize,
-                                      plateSize);
-        NSBezierPath *platePath = [NSBezierPath bezierPathWithRoundedRect:plateRect
-                                                                  xRadius:plateSize * 0.28
-                                                                  yRadius:plateSize * 0.28];
-
-        [NSGraphicsContext saveGraphicsState];
-        NSShadow *plateShadow = [[NSShadow alloc] init];
-        plateShadow.shadowColor = [NSColor colorWithRed:0.02 green:0.03 blue:0.05 alpha:0.48];
-        plateShadow.shadowOffset = NSMakeSize(0, 18.0 * uiScale);
-        plateShadow.shadowBlurRadius = 36.0 * uiScale;
-        [plateShadow set];
-        NSGradient *plateGradient = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithRed:0.25 green:0.31 blue:0.44 alpha:0.92]
-                                                                  endingColor:[NSColor colorWithRed:0.14 green:0.17 blue:0.25 alpha:0.96]];
-        [plateGradient drawInBezierPath:platePath angle:90];
-        [NSGraphicsContext restoreGraphicsState];
-
-        [[NSColor colorWithWhite:1.0 alpha:0.12] setStroke];
-        [platePath setLineWidth:1.0];
-        [platePath stroke];
-
-        NSBezierPath *innerPlatePath = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(plateRect, 10.0 * uiScale, 10.0 * uiScale)
-                                                                       xRadius:plateSize * 0.20
-                                                                       yRadius:plateSize * 0.20];
-        [[NSColor colorWithWhite:1.0 alpha:0.04] setFill];
-        [innerPlatePath fill];
-
-        // Custom AirPlay glyph so we control color and weight consistently.
-        NSColor *glyphColor = [NSColor colorWithRed:0.95 green:0.97 blue:1.0 alpha:0.94];
-        CGFloat screenWidth = plateSize * 0.50;
-        CGFloat screenHeight = screenWidth * 0.36;
-        CGFloat screenX = NSMidX(plateRect) - screenWidth / 2.0;
-        CGFloat screenY = plateRect.origin.y + plateSize * 0.28;
-        NSBezierPath *screenPath = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(screenX, screenY, screenWidth, screenHeight)
-                                                                   xRadius:screenHeight * 0.18
-                                                                   yRadius:screenHeight * 0.18];
-        [glyphColor setStroke];
-        [screenPath setLineWidth:MAX(2.0, plateSize * 0.026)];
-        [screenPath stroke];
-
-        CGFloat triangleWidth = plateSize * 0.24;
-        CGFloat triangleHeight = plateSize * 0.17;
-        CGFloat triangleCenterX = NSMidX(plateRect);
-        CGFloat triangleTopY = screenY + screenHeight + plateSize * 0.08;
-        NSBezierPath *trianglePath = [NSBezierPath bezierPath];
-        [trianglePath moveToPoint:NSMakePoint(triangleCenterX, triangleTopY)];
-        [trianglePath lineToPoint:NSMakePoint(triangleCenterX - triangleWidth / 2.0, triangleTopY + triangleHeight)];
-        [trianglePath lineToPoint:NSMakePoint(triangleCenterX + triangleWidth / 2.0, triangleTopY + triangleHeight)];
-        [trianglePath closePath];
-        [glyphColor setFill];
-        [trianglePath fill];
-
-        CGFloat titleFontSize = fmax(48.0 * uiScale, fmin(minDimension * 0.086, 82.0 * uiScale));
-        CGFloat subtitleFontSize = fmax(22.0 * uiScale, fmin(minDimension * 0.034, 34.0 * uiScale));
-        CGFloat captionFontSize = fmax(11.0 * uiScale, fmin(minDimension * 0.016, 15.0 * uiScale));
-        NSString *titleText = @"Ready for AirPlay";
-        NSString *subtitleText = @"Choose this receiver in Screen Mirroring to begin streaming.";
-
-        NSShadow *titleShadow = [[NSShadow alloc] init];
-        titleShadow.shadowColor = [NSColor colorWithWhite:0.0 alpha:0.55];
-        titleShadow.shadowOffset = NSMakeSize(0, 3.0 * uiScale);
-        titleShadow.shadowBlurRadius = 18.0 * uiScale;
-
-        NSDictionary *titleAttrs = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:titleFontSize weight:NSFontWeightSemibold],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.95],
-            NSParagraphStyleAttributeName: centerStyle,
-            NSShadowAttributeName: titleShadow
-        };
-        NSDictionary *subtitleAttrs = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:subtitleFontSize weight:NSFontWeightRegular],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.68],
-            NSParagraphStyleAttributeName: centerStyle
-        };
-        NSDictionary *captionAttrs = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:captionFontSize weight:NSFontWeightSemibold],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.48],
-            NSParagraphStyleAttributeName: centerStyle
-        };
-
-        NSRect titleRect = NSMakeRect(canvasWidth * 0.14,
-                                      CGRectGetMaxY(plateRect) + minDimension * 0.055,
-                                      canvasWidth * 0.72,
-                                      titleFontSize * 1.2);
-        [titleText drawInRect:titleRect withAttributes:titleAttrs];
-
-        NSRect subtitleRect = NSMakeRect(canvasWidth * 0.15,
-                                         CGRectGetMaxY(titleRect) + minDimension * 0.01,
-                                         canvasWidth * 0.70,
-                                         subtitleFontSize * 1.6);
-        [subtitleText drawWithRect:subtitleRect
-                           options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine
-                        attributes:subtitleAttrs];
-
-        NSString *availabilityText = @"AVAILABLE AS";
-        NSRect availabilityRect = NSMakeRect(0.0,
-                                             CGRectGetMaxY(subtitleRect) + minDimension * 0.028,
-                                             canvasWidth,
-                                             captionFontSize * 1.2);
-        [availabilityText drawInRect:availabilityRect withAttributes:captionAttrs];
-
-        NSString *serverText = g_server_name ? [NSString stringWithUTF8String:g_server_name] : @"This Mac";
-        CGFloat serverFontSize = fmax(19.0 * uiScale, fmin(minDimension * 0.030, 28.0 * uiScale));
-        NSMutableParagraphStyle *serverStyle = [centerStyle mutableCopy];
-        serverStyle.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        NSDictionary *serverAttrs = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:serverFontSize weight:NSFontWeightMedium],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.88],
-            NSParagraphStyleAttributeName: serverStyle
-        };
-        NSRect serverMeasureRect = [serverText boundingRectWithSize:NSMakeSize(canvasWidth * 0.70, CGFLOAT_MAX)
-                                                            options:NSStringDrawingUsesLineFragmentOrigin
-                                                         attributes:serverAttrs];
-        CGFloat serverPillWidth = MIN(canvasWidth * 0.78, MAX(serverMeasureRect.size.width + 44.0 * uiScale, 300.0 * uiScale));
-        CGFloat serverPillHeight = MAX(serverMeasureRect.size.height + 18.0 * uiScale, 48.0 * uiScale);
-        NSRect serverPillRect = NSMakeRect((canvasWidth - serverPillWidth) / 2.0,
-                                           CGRectGetMaxY(availabilityRect) + 10.0,
-                                           serverPillWidth,
-                                           serverPillHeight);
-        NSBezierPath *serverPillPath = [NSBezierPath bezierPathWithRoundedRect:serverPillRect
-                                                                       xRadius:serverPillHeight / 2.0
-                                                                       yRadius:serverPillHeight / 2.0];
-        [[NSColor colorWithWhite:1.0 alpha:0.09] setFill];
-        [serverPillPath fill];
-        [[NSColor colorWithWhite:1.0 alpha:0.12] setStroke];
-        [serverPillPath setLineWidth:1.0];
-        [serverPillPath stroke];
-        [serverText drawWithRect:NSInsetRect(serverPillRect, 22.0 * uiScale, 11.0 * uiScale)
-                         options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine
-                      attributes:serverAttrs];
-
-        CGFloat shortcutPanelWidth = MIN(canvasWidth * 0.86, 1120.0 * uiScale);
-        CGFloat shortcutPanelHeight = fmax(112.0 * uiScale, fmin(minDimension * 0.20, 152.0 * uiScale));
-        CGFloat shortcutPanelBottomMargin = fmax(18.0 * uiScale, canvasHeight * 0.030);
-        CGFloat minimumPillToPanelGap = fmax(32.0 * uiScale, minDimension * 0.036);
-        CGFloat minimumPanelY = CGRectGetMaxY(serverPillRect) + minimumPillToPanelGap;
-        CGFloat maximumPanelY = canvasHeight - shortcutPanelHeight - shortcutPanelBottomMargin;
-        CGFloat shortcutPanelY = fmin(maximumPanelY, fmax(canvasHeight - shortcutPanelHeight - fmax(28.0, canvasHeight * 0.055),
-                                                          minimumPanelY));
-        NSRect shortcutPanelRect = NSMakeRect((canvasWidth - shortcutPanelWidth) / 2.0,
-                                              shortcutPanelY,
-                                              shortcutPanelWidth,
-                                              shortcutPanelHeight);
-        NSBezierPath *shortcutPanelPath = [NSBezierPath bezierPathWithRoundedRect:shortcutPanelRect
-                                                                          xRadius:24.0 * uiScale
-                                                                          yRadius:24.0 * uiScale];
-        [[NSColor colorWithWhite:1.0 alpha:0.08] setFill];
-        [shortcutPanelPath fill];
-        [[NSColor colorWithWhite:1.0 alpha:0.10] setStroke];
-        [shortcutPanelPath setLineWidth:1.0];
-        [shortcutPanelPath stroke];
-
-        CGFloat primaryFontSize = fmax(17.0 * uiScale, fmin(minDimension * 0.026, 24.0 * uiScale));
-        CGFloat secondaryFontSize = fmax(15.0 * uiScale, fmin(minDimension * 0.022, 20.0 * uiScale));
-        NSDictionary *primaryKeyAttrs = @{
-            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:primaryFontSize weight:NSFontWeightSemibold],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.92],
-            NSParagraphStyleAttributeName: centerStyle
-        };
-        NSDictionary *primaryLabelAttrs = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:primaryFontSize weight:NSFontWeightRegular],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.70],
-            NSParagraphStyleAttributeName: centerStyle
-        };
-        NSDictionary *secondaryKeyAttrs = @{
-            NSFontAttributeName: [NSFont monospacedSystemFontOfSize:secondaryFontSize weight:NSFontWeightSemibold],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.82],
-            NSParagraphStyleAttributeName: centerStyle
-        };
-        NSDictionary *secondaryLabelAttrs = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:secondaryFontSize weight:NSFontWeightRegular],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.56],
-            NSParagraphStyleAttributeName: centerStyle
-        };
-        NSDictionary *separatorAttrs = @{
-            NSFontAttributeName: [NSFont systemFontOfSize:primaryFontSize weight:NSFontWeightRegular],
-            NSForegroundColorAttributeName: [[NSColor whiteColor] colorWithAlphaComponent:0.26],
-            NSParagraphStyleAttributeName: centerStyle
-        };
-
-        NSMutableAttributedString *primaryLine = [[NSMutableAttributedString alloc] init];
-        NSMutableAttributedString *secondaryLine = [[NSMutableAttributedString alloc] init];
-        void (^appendShortcut)(NSMutableAttributedString *, NSDictionary *, NSDictionary *, NSString *, NSString *) =
-        ^(NSMutableAttributedString *line, NSDictionary *keyAttributes, NSDictionary *labelAttributes, NSString *key, NSString *label) {
-            if ([line length] > 0) {
-                [line appendAttributedString:[[NSAttributedString alloc] initWithString:@"   |   " attributes:separatorAttrs]];
-            }
-            [line appendAttributedString:[[NSAttributedString alloc] initWithString:key attributes:keyAttributes]];
-            [line appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:labelAttributes]];
-            [line appendAttributedString:[[NSAttributedString alloc] initWithString:label attributes:labelAttributes]];
-        };
-
-        appendShortcut(primaryLine, primaryKeyAttrs, primaryLabelAttrs, @"F", @"Fullscreen");
-        appendShortcut(primaryLine, primaryKeyAttrs, primaryLabelAttrs, @"Space", @"Pause/Resume");
-        appendShortcut(primaryLine, primaryKeyAttrs, primaryLabelAttrs, @"Q", @"Quit");
-
-        appendShortcut(secondaryLine, secondaryKeyAttrs, secondaryLabelAttrs, @"R", @"Rotate CW");
-        appendShortcut(secondaryLine, secondaryKeyAttrs, secondaryLabelAttrs, @"Shift+R", @"Rotate CCW");
-        appendShortcut(secondaryLine, secondaryKeyAttrs, secondaryLabelAttrs, @"Cmd+0", @"Reset");
-
-        CGFloat panelInsetX = 34.0 * uiScale;
-        CGFloat primaryLineHeight = primaryFontSize * 1.35;
-        CGFloat secondaryLineHeight = secondaryFontSize * 1.35;
-        CGFloat lineGap = 9.0 * uiScale;
-        CGFloat primaryLineY = shortcutPanelRect.origin.y + 24.0 * uiScale;
-        CGFloat secondaryLineY = primaryLineY + primaryLineHeight + lineGap;
-        NSRect primaryLineRect = NSMakeRect(shortcutPanelRect.origin.x + panelInsetX,
-                                            primaryLineY,
-                                            shortcutPanelRect.size.width - panelInsetX * 2.0,
-                                            primaryLineHeight);
-        NSRect secondaryLineRect = NSMakeRect(shortcutPanelRect.origin.x + panelInsetX,
-                                              secondaryLineY,
-                                              shortcutPanelRect.size.width - panelInsetX * 2.0,
-                                              secondaryLineHeight);
-        [primaryLine drawWithRect:primaryLineRect
-                          options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine];
-        [secondaryLine drawWithRect:secondaryLineRect
-                            options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine];
-
-        [NSGraphicsContext restoreGraphicsState];
-        CGContextRelease(cgContext);
-
-        // Create Metal texture from the bitmap data
-        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                             width:width
-                                                                                            height:height
-                                                                                         mipmapped:NO];
-        descriptor.usage = MTLTextureUsageShaderRead;
-
-        g_idle_texture = [g_metal_device newTextureWithDescriptor:descriptor];
-
-        MTLRegion region = MTLRegionMake2D(0, 0, width, height);
-        [g_idle_texture replaceRegion:region
-                          mipmapLevel:0
-                            withBytes:pixelData
-                          bytesPerRow:bytesPerRow];
-
-        g_idle_texture_created = true;
-        log_msg(LOGGER_DEBUG, "Idle screen texture created (%zux%zu)", width, height);
-
-        free(pixelData);
-    }
 }
 
 #pragma mark - FPS Overlay
@@ -1575,9 +1267,9 @@ static void request_cover_art_texture_rebuild(void) {
 @implementation MetalRenderer
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
-    // Recreate idle texture when size changes
-    g_idle_texture_created = false;
-    g_idle_texture = nil;
+    // Kept as a no-op for MTKViewDelegate conformance: with the standby screen
+    // gone there is no idle texture to invalidate — the last presented frame
+    // simply scales with the drawable.
 }
 
 - (void)drawInMTKView:(MTKView *)view {
@@ -1591,7 +1283,7 @@ static void request_cover_art_texture_rebuild(void) {
     g_has_new_frame = false;
     pthread_mutex_unlock(&g_frame_mutex);
 
-    // Static content (cover art / idle) - only redraw when state changes
+    // Static content (cover art) - only redraw when state changes
     if (g_showing_cover_art) {
         if (!g_cover_art_texture_created || !g_cover_art_texture) {
             if (pixelBuffer) CVPixelBufferRelease(pixelBuffer);
@@ -1670,44 +1362,10 @@ static void request_cover_art_texture_rebuild(void) {
         return;
     }
 
-    // No frame available - show idle screen
+    // No frame available (before the first frame or after a decode gap): keep
+    // the last presented frame on screen — this renderer has no standby screen
+    // any more, so there is nothing to draw until the next frame arrives.
     if (!pixelBuffer) {
-        @autoreleasepool {
-            dispatch_semaphore_wait(g_inflight_semaphore, DISPATCH_TIME_FOREVER);
-            id<MTLCommandBuffer> commandBuffer = [g_command_queue commandBuffer];
-            [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull cb) {
-                (void)cb;
-                dispatch_semaphore_signal(g_inflight_semaphore);
-            }];
-            id<CAMetalDrawable> drawable = [view currentDrawable];
-
-            if (drawable && g_metal_device) {
-                if (!g_idle_texture_created || !g_idle_texture) {
-                    create_idle_texture(drawable.texture.width, drawable.texture.height);
-                }
-
-                if (g_idle_texture) {
-                    id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
-                    [blitEncoder copyFromTexture:g_idle_texture
-                                     sourceSlice:0
-                                     sourceLevel:0
-                                    sourceOrigin:MTLOriginMake(0, 0, 0)
-                                      sourceSize:MTLSizeMake(g_idle_texture.width, g_idle_texture.height, 1)
-                                       toTexture:drawable.texture
-                                destinationSlice:0
-                                destinationLevel:0
-                               destinationOrigin:MTLOriginMake(0, 0, 0)];
-                    [blitEncoder endEncoding];
-
-                    [commandBuffer presentDrawable:drawable];
-                    [commandBuffer commit];
-                } else {
-                    dispatch_semaphore_signal(g_inflight_semaphore);
-                }
-            } else {
-                dispatch_semaphore_signal(g_inflight_semaphore);
-            }
-        }
         return;
     }
 
@@ -1977,31 +1635,29 @@ static void create_window_on_main_thread(const char *title) {
         [g_window setContentView:g_container_view];
         [g_window makeFirstResponder:g_metal_view];
 
-        // Make app appear in dock and bring window to front
+        // Window-driven Dock presence: promote to Regular while the projection
+        // window exists (the helper's Info.plist starts the process as a
+        // UIElement) and bring the window to front. The teardown paths
+        // withdraw the Dock presence again once the window is gone.
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         [NSApp activateIgnoringOtherApps:YES];
         [g_window makeKeyAndOrderFront:nil];
         [g_window setLevel:NSNormalWindowLevel];
 
-        // Set a default app icon (using system SF Symbol or fallback)
-        if (@available(macOS 11.0, *)) {
-            NSImage *icon = [NSImage imageWithSystemSymbolName:@"airplayvideo"
-                                      accessibilityDescription:@"AirPlay"];
-            if (icon) {
-                // Tint the SF Symbol to make it more visible
-                NSImage *tintedIcon = [icon copy];
-                [tintedIcon lockFocus];
-                [[NSColor systemBlueColor] set];
-                NSRect imageRect = NSMakeRect(0, 0, tintedIcon.size.width, tintedIcon.size.height);
-                NSRectFillUsingOperation(imageRect, NSCompositingOperationSourceAtop);
-                [tintedIcon unlockFocus];
-                [NSApp setApplicationIconImage:tintedIcon];
-            } else {
-                [NSApp setApplicationIconImage:[NSImage imageNamed:NSImageNameNetwork]];
-            }
-        } else {
-            [NSApp setApplicationIconImage:[NSImage imageNamed:NSImageNameNetwork]];
+        // Keep the process out of App Nap for the life of the session window:
+        // without user activity the system otherwise throttles timers/sockets
+        // and can stretch short decode gaps (runningboardd showed the App Nap
+        // account flipping during streaming). Ended again in destroy_window.
+        if (g_activity_token == nil) {
+            g_activity_token = [[NSProcessInfo processInfo]
+                beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
+                                  reason:@"AirPlay mirroring session"];
         }
+
+        // The Dock tile identity comes from the helper bundle: macOS reads the
+        // icon from the bundle's AppIcon.icns (CFBundleIconFile). No runtime
+        // icon is set here — an explicit one would mask the bundle icon with a
+        // generic system symbol and outlive the window.
 
         // Create menu bar and set window delegate for close button handling
         g_menu_handler = [[UxPlayMenuHandler alloc] init];
@@ -2036,7 +1692,11 @@ static void create_window_on_main_thread(const char *title) {
 
         layout_video_views_on_main_thread();
 
-        // Start stall detection timer (checks every second)
+        // Decode-gap watchdog (diagnostics only): the window keeps showing the
+        // last presented frame while no new frame is decoded, so this timer no
+        // longer switches the screen or the title — it only records gap starts
+        // with wall-clock timestamps. Together with the pause/resume lines it
+        // later tells a sender-side pause apart from receiver-side throttling.
         g_stall_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
         dispatch_source_set_timer(g_stall_timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 4);
         dispatch_source_set_event_handler(g_stall_timer, ^{
@@ -2045,22 +1705,13 @@ static void create_window_on_main_thread(const char *title) {
                 mach_timebase_info(&timebase);
                 double elapsed = (double)(mach_absolute_time() - g_last_frame_time) * timebase.numer / timebase.denom / 1e9;
                 if (elapsed > FRAME_STALL_TIMEOUT) {
-                    pthread_mutex_lock(&g_frame_mutex);
-                    if (g_pending_frame) {
-                        CVPixelBufferRelease(g_pending_frame);
-                        g_pending_frame = NULL;
-                    }
-                    pthread_mutex_unlock(&g_frame_mutex);
-                    g_last_frame_time = 0;
-                    update_window_title("Ready");
                     uint64_t now = mach_absolute_time();
                     double since_last_log = (g_last_stall_log_time > 0) ?
                         (double)(now - g_last_stall_log_time) * timebase.numer / timebase.denom / 1e9 : 999.0;
                     if (since_last_log > 30.0) {
-                        log_msg(LOGGER_INFO, "Stream stalled, returning to idle screen");
+                        log_msg(LOGGER_INFO, "Decode gap: no decoded frame for %.1fs (last frame kept on screen; t=%.3f)",
+                                elapsed, wall_time_seconds());
                         g_last_stall_log_time = now;
-                    } else {
-                        log_msg(LOGGER_DEBUG, "Stream stalled, returning to idle screen");
                     }
                 }
             }
@@ -2088,12 +1739,22 @@ static void destroy_window(void) {
                 [g_window close];
                 g_window = nil;
             }
+            // The projection window was the Dock presence: with it gone the
+            // app goes back to accessory (no Dock item). Covers both callers
+            // of this teardown (session stop and renderer destroy); the guard
+            // keeps the policy untouched whenever a window is still present.
+            withdraw_dock_presence_if_windowless();
+
+            // Session over: drop the App Nap opt-out again (see the matching
+            // begin in create_window_on_main_thread).
+            if (g_activity_token != nil) {
+                [[NSProcessInfo processInfo] endActivity:g_activity_token];
+                g_activity_token = nil;
+            }
             if (g_texture_cache) {
                 CFRelease(g_texture_cache);
                 g_texture_cache = NULL;
             }
-            g_idle_texture = nil;
-            g_idle_texture_created = false;
             g_metal_view = nil;
             g_metal_view_fill_constraints = nil;
             g_rotation_host_fill_constraints = nil;
@@ -2451,6 +2112,19 @@ static void decompress_callback(void *decompressionOutputRefCon,
     g_frames_decoded++;
     g_fps_decode_count++;
     uint64_t now = mach_absolute_time();
+
+    // Decode-gap end: first decoded frame after a >30s gap. Paired with the
+    // "Decode gap:" watchdog line this bounds each gap with wall-clock
+    // timestamps (empty-window diagnostics; no state is reset here).
+    if (g_last_frame_time > 0) {
+        mach_timebase_info_data_t timebase;
+        mach_timebase_info(&timebase);
+        double gap = (double)(now - g_last_frame_time) * timebase.numer / timebase.denom / 1e9;
+        if (gap > FRAME_STALL_TIMEOUT) {
+            log_msg(LOGGER_INFO, "Decode gap ended: frame flow resumed after %.1fs (t=%.3f)",
+                    gap, wall_time_seconds());
+        }
+    }
     g_last_frame_time = now;
 
     // Estimate source frame interval using exponential moving average
@@ -2748,7 +2422,7 @@ void video_renderer_stop(void) {
     // video_renderer_start is only called once at init, not per-connection
     destroy_decoder_session();
 
-    // Clear pending frame so idle screen is shown
+    // Clear pending frame: it belongs to the session that just ended
     pthread_mutex_lock(&g_frame_mutex);
     if (g_pending_frame) {
         CVPixelBufferRelease(g_pending_frame);
@@ -2786,9 +2460,6 @@ void video_renderer_stop(void) {
     // Clear current texture reference
     g_current_texture = nil;
 
-    // Reset idle texture so it regenerates at the correct size
-    g_idle_texture_created = false;
-    g_idle_texture = nil;
     g_manual_rotation_degrees = 0;
 
     // Preserve cover art state - cover art should persist across stream resets
@@ -2832,10 +2503,15 @@ void video_renderer_set_track_metadata(const char *title, const char *artist, co
 }
 
 void video_renderer_pause(void) {
+    // Client-side stream suspension (mirroring 0x56/0x5e "stream stopping",
+    // e.g. the sender's screen locking): wall-clock stamped so a stalled
+    // decode window can be attributed later.
+    log_msg(LOGGER_INFO, "Video stream paused by client (t=%.3f)", wall_time_seconds());
     set_video_paused(true, false);
 }
 
 void video_renderer_resume(void) {
+    log_msg(LOGGER_INFO, "Video stream resumed by client (t=%.3f)", wall_time_seconds());
     set_video_paused(false, false);
 }
 
@@ -2849,7 +2525,7 @@ static void expire_cover_art_on_main_thread(void) {
     g_cover_art_texture_rebuild_pending = false;
     g_cover_art_texture = nil;
     g_cover_art = nil;
-    log_msg(LOGGER_INFO, "Cover art expired, returning to idle screen");
+    log_msg(LOGGER_INFO, "Cover art expired; holding the last presented frame");
     update_window_title(NULL);
 }
 
