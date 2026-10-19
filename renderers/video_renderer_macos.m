@@ -1889,178 +1889,201 @@ static MetalRenderer *g_metal_renderer = NULL;
 
 #pragma mark - Window Management
 
-static void create_window(const char *title) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            NSRect frame = NSMakeRect(100, 100, 1280, 720);
+// Creates the display window on the main thread. Callers must run on the
+// main thread; use ensure_window() for a thread-safe create-if-needed call.
+static void create_window_on_main_thread(const char *title) {
+    @autoreleasepool {
+        NSRect frame = NSMakeRect(100, 100, 1280, 720);
 
-            NSWindowStyleMask style = NSWindowStyleMaskTitled |
-                                      NSWindowStyleMaskClosable |
-                                      NSWindowStyleMaskResizable |
-                                      NSWindowStyleMaskMiniaturizable;
+        NSWindowStyleMask style = NSWindowStyleMaskTitled |
+                                  NSWindowStyleMaskClosable |
+                                  NSWindowStyleMaskResizable |
+                                  NSWindowStyleMaskMiniaturizable;
 
-            // Use custom window class for keyboard handling
-            g_window = [[UxPlayWindow alloc] initWithContentRect:frame
-                                                       styleMask:style
-                                                         backing:NSBackingStoreBuffered
-                                                           defer:NO];
+        // Use custom window class for keyboard handling
+        g_window = [[UxPlayWindow alloc] initWithContentRect:frame
+                                                   styleMask:style
+                                                     backing:NSBackingStoreBuffered
+                                                       defer:NO];
 
-            [g_window setTitle:[NSString stringWithUTF8String:title ?: "UxPlay"]];
-            [g_window setReleasedWhenClosed:NO];
+        [g_window setTitle:[NSString stringWithUTF8String:title ?: "UxPlay"]];
+        [g_window setReleasedWhenClosed:NO];
 
-            // Create Metal device and view
-            g_metal_device = MTLCreateSystemDefaultDevice();
-            if (!g_metal_device) {
-                log_msg(LOGGER_ERR, "Failed to create Metal device");
-                return;
-            }
+        // Create Metal device and view
+        g_metal_device = MTLCreateSystemDefaultDevice();
+        if (!g_metal_device) {
+            log_msg(LOGGER_ERR, "Failed to create Metal device");
+            return;
+        }
 
-            // Subview frames use origin (0,0) relative to their superview
-            NSRect viewFrame = NSMakeRect(0, 0, frame.size.width, frame.size.height);
+        // Subview frames use origin (0,0) relative to their superview
+        NSRect viewFrame = NSMakeRect(0, 0, frame.size.width, frame.size.height);
 
-            // Use custom Metal view for double-click handling
-            g_metal_view = [[UxPlayMetalView alloc] initWithFrame:viewFrame device:g_metal_device];
-            g_metal_view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-            g_metal_view.framebufferOnly = NO;
-            g_metal_view.preferredFramesPerSecond = NSScreen.mainScreen.maximumFramesPerSecond;
+        // Use custom Metal view for double-click handling
+        g_metal_view = [[UxPlayMetalView alloc] initWithFrame:viewFrame device:g_metal_device];
+        g_metal_view.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
+        g_metal_view.framebufferOnly = NO;
+        g_metal_view.preferredFramesPerSecond = NSScreen.mainScreen.maximumFramesPerSecond;
 
-            // Triple-buffer semaphore for smooth GPU pipelining
-            g_inflight_semaphore = dispatch_semaphore_create(3);
+        // Triple-buffer semaphore for smooth GPU pipelining
+        g_inflight_semaphore = dispatch_semaphore_create(3);
 
-            g_metal_renderer = [[MetalRenderer alloc] init];
-            g_metal_view.delegate = g_metal_renderer;
+        g_metal_renderer = [[MetalRenderer alloc] init];
+        g_metal_view.delegate = g_metal_renderer;
 
-            g_command_queue = [g_metal_device newCommandQueue];
+        g_command_queue = [g_metal_device newCommandQueue];
 
-            // Create texture cache
-            CVMetalTextureCacheCreate(kCFAllocatorDefault,
-                                      NULL,
-                                      g_metal_device,
-                                      NULL,
-                                      &g_texture_cache);
+        // Create texture cache
+        CVMetalTextureCacheCreate(kCFAllocatorDefault,
+                                  NULL,
+                                  g_metal_device,
+                                  NULL,
+                                  &g_texture_cache);
 
-            // Container view: fills window, clips children, provides black letterbox background
-            g_container_view = [[NSView alloc] initWithFrame:viewFrame];
-            g_container_view.wantsLayer = YES;
-            g_container_view.layer.backgroundColor = [[NSColor blackColor] CGColor];
-            g_container_view.layer.masksToBounds = YES;
+        // Container view: fills window, clips children, provides black letterbox background
+        g_container_view = [[NSView alloc] initWithFrame:viewFrame];
+        g_container_view.wantsLayer = YES;
+        g_container_view.layer.backgroundColor = [[NSColor blackColor] CGColor];
+        g_container_view.layer.masksToBounds = YES;
 
-            // Rotation host view: receives CA rotation transform, sized to source dimensions
-            g_rotation_host_view = [[NSView alloc] initWithFrame:viewFrame];
-            g_rotation_host_view.wantsLayer = YES;
-            g_rotation_host_view.layer.masksToBounds = NO;
-            g_rotation_host_view.layer.anchorPoint = CGPointMake(0.5, 0.5);
+        // Rotation host view: receives CA rotation transform, sized to source dimensions
+        g_rotation_host_view = [[NSView alloc] initWithFrame:viewFrame];
+        g_rotation_host_view.wantsLayer = YES;
+        g_rotation_host_view.layer.masksToBounds = NO;
+        g_rotation_host_view.layer.anchorPoint = CGPointMake(0.5, 0.5);
 
-            // MTKView always fills the rotation host view
-            g_rotation_host_view.translatesAutoresizingMaskIntoConstraints = NO;
-            g_metal_view.translatesAutoresizingMaskIntoConstraints = NO;
-            [g_rotation_host_view addSubview:g_metal_view];
+        // MTKView always fills the rotation host view
+        g_rotation_host_view.translatesAutoresizingMaskIntoConstraints = NO;
+        g_metal_view.translatesAutoresizingMaskIntoConstraints = NO;
+        [g_rotation_host_view addSubview:g_metal_view];
 
-            g_rotation_host_fill_constraints = @[
-                [g_rotation_host_view.leadingAnchor constraintEqualToAnchor:g_container_view.leadingAnchor],
-                [g_rotation_host_view.trailingAnchor constraintEqualToAnchor:g_container_view.trailingAnchor],
-                [g_rotation_host_view.topAnchor constraintEqualToAnchor:g_container_view.topAnchor],
-                [g_rotation_host_view.bottomAnchor constraintEqualToAnchor:g_container_view.bottomAnchor]
-            ];
-            g_metal_view_fill_constraints = @[
-                [g_metal_view.leadingAnchor constraintEqualToAnchor:g_rotation_host_view.leadingAnchor],
-                [g_metal_view.trailingAnchor constraintEqualToAnchor:g_rotation_host_view.trailingAnchor],
-                [g_metal_view.topAnchor constraintEqualToAnchor:g_rotation_host_view.topAnchor],
-                [g_metal_view.bottomAnchor constraintEqualToAnchor:g_rotation_host_view.bottomAnchor]
-            ];
+        g_rotation_host_fill_constraints = @[
+            [g_rotation_host_view.leadingAnchor constraintEqualToAnchor:g_container_view.leadingAnchor],
+            [g_rotation_host_view.trailingAnchor constraintEqualToAnchor:g_container_view.trailingAnchor],
+            [g_rotation_host_view.topAnchor constraintEqualToAnchor:g_container_view.topAnchor],
+            [g_rotation_host_view.bottomAnchor constraintEqualToAnchor:g_container_view.bottomAnchor]
+        ];
+        g_metal_view_fill_constraints = @[
+            [g_metal_view.leadingAnchor constraintEqualToAnchor:g_rotation_host_view.leadingAnchor],
+            [g_metal_view.trailingAnchor constraintEqualToAnchor:g_rotation_host_view.trailingAnchor],
+            [g_metal_view.topAnchor constraintEqualToAnchor:g_rotation_host_view.topAnchor],
+            [g_metal_view.bottomAnchor constraintEqualToAnchor:g_rotation_host_view.bottomAnchor]
+        ];
 
-            [g_container_view addSubview:g_rotation_host_view];
-            [NSLayoutConstraint activateConstraints:g_rotation_host_fill_constraints];
-            [NSLayoutConstraint activateConstraints:g_metal_view_fill_constraints];
-            g_rotation_host_constraints_active = true;
-            [g_window setContentView:g_container_view];
-            [g_window makeFirstResponder:g_metal_view];
+        [g_container_view addSubview:g_rotation_host_view];
+        [NSLayoutConstraint activateConstraints:g_rotation_host_fill_constraints];
+        [NSLayoutConstraint activateConstraints:g_metal_view_fill_constraints];
+        g_rotation_host_constraints_active = true;
+        [g_window setContentView:g_container_view];
+        [g_window makeFirstResponder:g_metal_view];
 
-            // Make app appear in dock and bring window to front
-            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-            [NSApp activateIgnoringOtherApps:YES];
-            [g_window makeKeyAndOrderFront:nil];
-            [g_window setLevel:NSNormalWindowLevel];
+        // Make app appear in dock and bring window to front
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [NSApp activateIgnoringOtherApps:YES];
+        [g_window makeKeyAndOrderFront:nil];
+        [g_window setLevel:NSNormalWindowLevel];
 
-            // Set a default app icon (using system SF Symbol or fallback)
-            if (@available(macOS 11.0, *)) {
-                NSImage *icon = [NSImage imageWithSystemSymbolName:@"airplayvideo"
-                                          accessibilityDescription:@"AirPlay"];
-                if (icon) {
-                    // Tint the SF Symbol to make it more visible
-                    NSImage *tintedIcon = [icon copy];
-                    [tintedIcon lockFocus];
-                    [[NSColor systemBlueColor] set];
-                    NSRect imageRect = NSMakeRect(0, 0, tintedIcon.size.width, tintedIcon.size.height);
-                    NSRectFillUsingOperation(imageRect, NSCompositingOperationSourceAtop);
-                    [tintedIcon unlockFocus];
-                    [NSApp setApplicationIconImage:tintedIcon];
-                } else {
-                    [NSApp setApplicationIconImage:[NSImage imageNamed:NSImageNameNetwork]];
-                }
+        // Set a default app icon (using system SF Symbol or fallback)
+        if (@available(macOS 11.0, *)) {
+            NSImage *icon = [NSImage imageWithSystemSymbolName:@"airplayvideo"
+                                      accessibilityDescription:@"AirPlay"];
+            if (icon) {
+                // Tint the SF Symbol to make it more visible
+                NSImage *tintedIcon = [icon copy];
+                [tintedIcon lockFocus];
+                [[NSColor systemBlueColor] set];
+                NSRect imageRect = NSMakeRect(0, 0, tintedIcon.size.width, tintedIcon.size.height);
+                NSRectFillUsingOperation(imageRect, NSCompositingOperationSourceAtop);
+                [tintedIcon unlockFocus];
+                [NSApp setApplicationIconImage:tintedIcon];
             } else {
                 [NSApp setApplicationIconImage:[NSImage imageNamed:NSImageNameNetwork]];
             }
+        } else {
+            [NSApp setApplicationIconImage:[NSImage imageNamed:NSImageNameNetwork]];
+        }
 
-            // Create menu bar and set window delegate for close button handling
-            g_menu_handler = [[UxPlayMenuHandler alloc] init];
-            [g_window setDelegate:g_menu_handler];
-            create_menu_bar();
+        // Create menu bar and set window delegate for close button handling
+        g_menu_handler = [[UxPlayMenuHandler alloc] init];
+        [g_window setDelegate:g_menu_handler];
+        create_menu_bar();
 
-            // Apply initial fullscreen if requested via -fs flag
-            if (g_initial_fullscreen) {
-                g_windowed_frame = frame;
-                NSScreen *screen = [g_window screen] ?: [NSScreen mainScreen];
-                NSRect screenFrame = [screen frame];
-                [g_window setStyleMask:NSWindowStyleMaskBorderless];
-                [g_window setFrame:screenFrame display:YES];
-                [g_window setLevel:NSScreenSaverWindowLevel];
-                [NSCursor hide];
-                g_fullscreen = true;
-                log_msg(LOGGER_INFO, "Starting in fullscreen mode");
+        // Apply initial fullscreen if requested via -fs flag
+        if (g_initial_fullscreen) {
+            g_windowed_frame = frame;
+            NSScreen *screen = [g_window screen] ?: [NSScreen mainScreen];
+            NSRect screenFrame = [screen frame];
+            [g_window setStyleMask:NSWindowStyleMaskBorderless];
+            [g_window setFrame:screenFrame display:YES];
+            [g_window setLevel:NSScreenSaverWindowLevel];
+            [NSCursor hide];
+            g_fullscreen = true;
+            log_msg(LOGGER_INFO, "Starting in fullscreen mode");
+        }
+
+        // If the stream dimensions are already known (e.g. the session's first
+        // frames decoded before this window existed), fit the window to the
+        // stream now — the same fit the first-frame path would have applied.
+        if (g_current_width > 0 && g_current_height > 0 && !g_fullscreen) {
+            CGFloat display_width = 0.0;
+            CGFloat display_height = 0.0;
+            get_base_display_dimensions(&display_width, &display_height);
+            if (display_width > 0.0 && display_height > 0.0) {
+                NSSize target_size = scaled_content_size_for_display(display_width, display_height);
+                resize_window_content(target_size.width, target_size.height, NO);
             }
+        }
 
-            layout_video_views_on_main_thread();
+        layout_video_views_on_main_thread();
 
-            // Start stall detection timer (checks every second)
-            g_stall_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-            dispatch_source_set_timer(g_stall_timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 4);
-            dispatch_source_set_event_handler(g_stall_timer, ^{
-                if (g_last_frame_time > 0) {
-                    mach_timebase_info_data_t timebase;
-                    mach_timebase_info(&timebase);
-                    double elapsed = (double)(mach_absolute_time() - g_last_frame_time) * timebase.numer / timebase.denom / 1e9;
-                    if (elapsed > FRAME_STALL_TIMEOUT) {
-                        pthread_mutex_lock(&g_frame_mutex);
-                        if (g_pending_frame) {
-                            CVPixelBufferRelease(g_pending_frame);
-                            g_pending_frame = NULL;
-                        }
-                        pthread_mutex_unlock(&g_frame_mutex);
-                        g_last_frame_time = 0;
-                        update_window_title("Ready");
-                        uint64_t now = mach_absolute_time();
-                        double since_last_log = (g_last_stall_log_time > 0) ?
-                            (double)(now - g_last_stall_log_time) * timebase.numer / timebase.denom / 1e9 : 999.0;
-                        if (since_last_log > 30.0) {
-                            log_msg(LOGGER_INFO, "Stream stalled, returning to idle screen");
-                            g_last_stall_log_time = now;
-                        } else {
-                            log_msg(LOGGER_DEBUG, "Stream stalled, returning to idle screen");
-                        }
+        // Start stall detection timer (checks every second)
+        g_stall_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(g_stall_timer, dispatch_time(DISPATCH_TIME_NOW, 0), NSEC_PER_SEC, NSEC_PER_SEC / 4);
+        dispatch_source_set_event_handler(g_stall_timer, ^{
+            if (g_last_frame_time > 0) {
+                mach_timebase_info_data_t timebase;
+                mach_timebase_info(&timebase);
+                double elapsed = (double)(mach_absolute_time() - g_last_frame_time) * timebase.numer / timebase.denom / 1e9;
+                if (elapsed > FRAME_STALL_TIMEOUT) {
+                    pthread_mutex_lock(&g_frame_mutex);
+                    if (g_pending_frame) {
+                        CVPixelBufferRelease(g_pending_frame);
+                        g_pending_frame = NULL;
+                    }
+                    pthread_mutex_unlock(&g_frame_mutex);
+                    g_last_frame_time = 0;
+                    update_window_title("Ready");
+                    uint64_t now = mach_absolute_time();
+                    double since_last_log = (g_last_stall_log_time > 0) ?
+                        (double)(now - g_last_stall_log_time) * timebase.numer / timebase.denom / 1e9 : 999.0;
+                    if (since_last_log > 30.0) {
+                        log_msg(LOGGER_INFO, "Stream stalled, returning to idle screen");
+                        g_last_stall_log_time = now;
+                    } else {
+                        log_msg(LOGGER_DEBUG, "Stream stalled, returning to idle screen");
                     }
                 }
-            });
-            dispatch_resume(g_stall_timer);
+            }
+        });
+        dispatch_resume(g_stall_timer);
 
-            log_msg(LOGGER_INFO, "Native macOS window created with Metal rendering (F=fullscreen, ESC=exit fullscreen, Q=quit)");
-        }
-    });
+        log_msg(LOGGER_INFO, "Native macOS window created with Metal rendering (F=fullscreen, ESC=exit fullscreen, Q=quit)");
+    }
 }
 
 static void destroy_window(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         @autoreleasepool {
+            // The window is session-scoped: reset the window-domain fullscreen
+            // state with it. A stale g_fullscreen would make the next session's
+            // window skip its fit paths and turn the first F press into a no-op;
+            // the cursor would stay hidden with no window left on screen.
+            if (g_fullscreen) {
+                [NSCursor unhide];
+                g_fullscreen = false;
+            }
+            g_windowed_frame = NSZeroRect;
+
             if (g_window) {
                 [g_window close];
                 g_window = nil;
@@ -2086,6 +2109,44 @@ static void destroy_window(void) {
             }
         }
     });
+}
+
+// Session gate for the display window: true only while a streaming session is
+// established. Opened when the client announces its codec (that packet always
+// precedes the session's first frame in RTP mirroring, and cover art announces
+// its codec right before the JPEG); closed by video_renderer_stop() and
+// video_renderer_destroy().
+static bool g_stream_session_active = false;
+
+// Creates the display window on demand — but only while a session is
+// established. The NMR window is session-scoped: uxplay must be windowless
+// while idle, the window appears with the session's first content, and it is
+// torn down again when the session ends. The gate also keeps late frames of a
+// closing session (still in flight when a teardown races the data thread)
+// from resurrecting the window. Safe to call from any thread; the window
+// itself is always created on the main thread.
+static void ensure_window(void) {
+    if (!g_stream_session_active) return;
+    if (g_window != NULL) return;
+
+    const char *title = g_server_name ? g_server_name : "UxPlay";
+
+    if ([NSThread isMainThread]) {
+        if (g_window == NULL) {
+            create_window_on_main_thread(title);
+        }
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            // Re-check the gate inside the block: a teardown may have closed
+            // the session (and enqueued destroy_window) between the checks
+            // above and this block reaching the main queue. Without the
+            // re-check, that late create would resurrect the window after
+            // teardown — with no later stop left to close it.
+            if (g_stream_session_active && g_window == NULL) {
+                create_window_on_main_thread(title);
+            }
+        });
+    }
 }
 
 #pragma mark - VideoToolbox Decoder
@@ -2664,8 +2725,10 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
     if (g_server_name) free(g_server_name);
     g_server_name = server_name ? strdup(server_name) : strdup("UxPlay");
 
-    // Create display window
-    create_window(server_name);
+    // No window here: the window is session-scoped and is created lazily by
+    // ensure_window() when the session's first content arrives (first video
+    // frame or cover art). While no session exists uxplay stays windowless.
+    g_stream_session_active = false;
 
     g_initialized = true;
     log_msg(LOGGER_INFO, "Native macOS video renderer initialized (VideoToolbox + Metal)");
@@ -2730,23 +2793,15 @@ void video_renderer_stop(void) {
 
     // Preserve cover art state - cover art should persist across stream resets
     // It will be cleared when a real video stream starts or the renderer is destroyed
-    if (!g_showing_cover_art) {
-        // Restore window to original size and ensure it's ready for new connections
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (g_window) {
-                cancel_manual_rotation_animation_on_main_thread();
-                if (!g_fullscreen) {
-                    resize_window_content(1280, 720, NO);
-                }
-                layout_video_views_on_main_thread();
-                // Ensure window stays visible and responsive
-                [g_window makeKeyAndOrderFront:nil];
-                [NSApp activateIgnoringOtherApps:YES];
-            }
-        });
 
-        update_window_title("Ready");
-    }
+    // Session ended (disconnect / stream teardown): close the session gate
+    // synchronously first — late frames of this closing session must not be
+    // able to open a new window — then tear the window down. The window is
+    // session-scoped: a stop closes it (D1), and ensure_window() recreates it
+    // when the next session's first content arrives (D3: reconnect pops it).
+    g_stream_session_active = false;
+    destroy_window();
+
     log_msg(LOGGER_INFO, "Video renderer stopped - ready for new stream");
 }
 
@@ -2827,6 +2882,11 @@ uint64_t video_renderer_render_buffer(unsigned char *data, int *data_len, int *n
         log_msg(LOGGER_DEBUG, "Renderer not running, dropping frame");
         return 0;
     }
+
+    // Stream content is arriving: make sure the session window exists
+    // (a no-op when the window is already up, or when no session has been
+    // established yet — see the session gate in ensure_window()).
+    ensure_window();
 
     // Validate data
     if (*data_len < 4) {
@@ -2967,6 +3027,7 @@ void video_renderer_flush(void) {
 
 void video_renderer_destroy(void) {
     g_running = false;
+    g_stream_session_active = false;
 
     destroy_decoder_session();
     destroy_window();
@@ -3019,6 +3080,9 @@ unsigned int video_renderer_listen(void *loop, int id) {
 
 void video_renderer_display_jpeg(const void *data, int *data_len) {
     if (!data || !data_len || *data_len <= 0) return;
+
+    // Cover art is stream content — make sure the session window exists.
+    ensure_window();
 
     log_msg(LOGGER_INFO, "Displaying cover art (JPEG, %d bytes)", *data_len);
 
@@ -3077,6 +3141,12 @@ bool video_get_playback_info(double *duration, double *position, double *seek_st
 int video_renderer_choose_codec(bool video_is_jpeg, bool video_is_h265) {
     bool codec_changed = false;
     bool had_decoder_session = false;
+
+    // A codec announcement marks the start of a streaming session: from here
+    // until video_renderer_stop() ensure_window() may create the window. This
+    // packet always precedes the session's first frame (RTP mirroring), and
+    // cover art announces its codec right before the JPEG arrives.
+    g_stream_session_active = true;
 
     pthread_mutex_lock(&g_decoder_mutex);
     codec_changed = (g_is_h265 != video_is_h265);
